@@ -10,6 +10,8 @@ All in one continuous conversation (user-assistant-user-assistant...).
 import json
 import logging
 import time
+import random
+import re
 from typing import Any
 
 from services.database import Database
@@ -21,6 +23,17 @@ from config.prompts.agent_autopost import AUTOPOST_AGENT_PROMPT
 from config.schemas import PLAN_SCHEMA, POST_TEXT_SCHEMA, TOOL_REACTION_SCHEMA
 
 logger = logging.getLogger(__name__)
+
+# Multiple fallback tweets — ensures a tweet always posts if LLM fails
+FALLBACK_TWEETS = [
+    "Keep going, little one. Even in the darkest storms, you're never alone. 🌙🐾",
+    "A quiet guardian watches over you, even in the rain. 🌧️🐱",
+    "Stay strong — every paw print leaves a mark in the heart. 🐾❤️",
+    "You are brave, even when the thunder shakes the glass. ⚡🐾",
+    "Soft paws, warm heart, never alone. 🌙🐾",
+    "Even small ones shine bright. Don't be afraid of the storm. ✨🐾",
+    "Silent support is the loudest love. 🐾💛"
+]
 
 
 def get_agent_system_prompt() -> str:
@@ -42,12 +55,7 @@ class AutoPostService:
 
     def _sanitize_plan(self, plan: list[dict]) -> list[dict]:
         """
-        Sanitize the agent's plan instead of hard-failing.
-
-        Rules:
-        - Only known tools allowed
-        - Max 3 steps
-        - generate_image must be last if present
+        Sanitize the agent's plan to allow only known tools and max 3 steps.
         """
         if not isinstance(plan, list):
             logger.warning("[AUTOPOST] Plan is not a list — stripping plan")
@@ -59,7 +67,6 @@ class AutoPostService:
         for step in plan:
             if not isinstance(step, dict):
                 continue
-
             tool_name = step.get("tool")
             params = step.get("params", {})
 
@@ -108,14 +115,13 @@ class AutoPostService:
                         "usage_percent": self.tier_manager.get_usage_percent()
                     }
 
-            # Step 1: Context
+            # Step 1: Load previous posts
             logger.info("[AUTOPOST] [1/5] Loading context...")
             previous_posts = await self.db.get_recent_posts_formatted(limit=50)
             logger.info(f"[AUTOPOST] [1/5] Loaded {len(previous_posts)} chars of previous posts")
 
             # Step 2: Initial messages
             system_prompt = SYSTEM_PROMPT + get_agent_system_prompt()
-
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"""Create a Twitter post. Here are your previous posts (don't repeat):
@@ -127,11 +133,25 @@ Now create your plan. What tools do you need (if any)?"""}
 
             # Step 3: Planner
             logger.info("[AUTOPOST] [2/5] Creating plan - calling LLM...")
-            plan_result = await self.llm.chat(messages, PLAN_SCHEMA)
+            plan_result_raw = await self.llm.chat(messages, PLAN_SCHEMA)
+
+            # Robust JSON parsing
+            plan_result = {}
+            if isinstance(plan_result_raw, dict):
+                plan_result = plan_result_raw
+            elif isinstance(plan_result_raw, str):
+                try:
+                    plan_result = json.loads(plan_result_raw)
+                except json.JSONDecodeError:
+                    match = re.search(r"\{.*\}", plan_result_raw, re.DOTALL)
+                    if match:
+                        try:
+                            plan_result = json.loads(match.group())
+                        except Exception:
+                            plan_result = {}
 
             raw_plan = plan_result.get("plan", [])
             reasoning = plan_result.get("reasoning", "")
-
             plan = self._sanitize_plan(raw_plan)
 
             tools_list = " -> ".join([s["tool"] for s in plan]) if plan else "none"
@@ -157,28 +177,43 @@ Now create your plan. What tools do you need (if any)?"""}
 
                 elif tool_name == "generate_image":
                     prompt = params.get("prompt", "")
-                    image_bytes = await TOOLS[tool_name](prompt)
-                    messages.append({"role": "user", "content": "Tool result (generate_image): completed"})
+                    try:
+                        image_bytes = await TOOLS[tool_name](prompt)
+                        messages.append({"role": "user", "content": "Tool result (generate_image): completed"})
+                    except Exception as e:
+                        logger.error(f"[AUTOPOST] generate_image failed: {e}")
+                        image_bytes = None
 
                 reaction = await self.llm.chat(messages, TOOL_REACTION_SCHEMA)
                 messages.append({"role": "assistant", "content": reaction.get("thinking", "")})
 
-            # Step 5: Final tweet
+            # Step 5: Generate final tweet
             logger.info("[AUTOPOST] [4/5] Generating tweet...")
             messages.append({"role": "user", "content": "Now write your final tweet text (max 280 characters). Just the tweet."})
 
-            post_result = await self.llm.chat(messages, POST_TEXT_SCHEMA)
+            post_result_raw = await self.llm.chat(messages, POST_TEXT_SCHEMA)
 
-            # SAFETY: tolerate string or dict
-            if isinstance(post_result, dict):
-                post_text = post_result.get("post_text") or post_result.get("post") or ""
-            else:
-                post_text = str(post_result)
+            # Extract tweet text safely
+            post_text = ""
+            if isinstance(post_result_raw, dict):
+                post_text = post_result_raw.get("post_text") or post_result_raw.get("post") or ""
+            elif isinstance(post_result_raw, str):
+                try:
+                    post_json = json.loads(post_result_raw)
+                    post_text = post_json.get("post_text") or post_json.get("post") or post_result_raw
+                except json.JSONDecodeError:
+                    post_text = post_result_raw
 
-            post_text = post_text.strip()[:280]
+            post_text = post_text.strip()[:280]  # truncate to Twitter limit
+
+            # Step 6: Use fallback if LLM fails
+            if not post_text:
+                post_text = random.choice(FALLBACK_TWEETS)[:280]
+                logger.info("[AUTOPOST] Using fallback tweet as LLM returned empty text.")
+
             logger.info(f"[AUTOPOST] Tweet ready ({len(post_text)} chars)")
 
-            # Step 6: Upload image
+            # Step 7: Upload image if any
             media_ids = None
             if image_bytes:
                 try:
@@ -188,7 +223,7 @@ Now create your plan. What tools do you need (if any)?"""}
                     logger.error(f"[AUTOPOST] Image upload failed: {e}")
                     image_bytes = None
 
-            # Step 7: Post
+            # Step 8: Post to Twitter
             tweet_data = await self.twitter.post(post_text, media_ids=media_ids)
             await self.db.save_post(post_text, tweet_data["id"], image_bytes is not None)
 
@@ -208,8 +243,4 @@ Now create your plan. What tools do you need (if any)?"""}
             duration = round(time.time() - start_time, 1)
             logger.error(f"[AUTOPOST] === FAILED after {duration}s ===")
             logger.exception(e)
-            return {
-                "success": False,
-                "error": str(e),
-                "duration_seconds": duration
-            }
+            return {"success": False, "error": str(e), "duration_seconds": duration}
