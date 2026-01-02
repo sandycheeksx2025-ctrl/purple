@@ -26,9 +26,6 @@ logger = logging.getLogger(__name__)
 def get_agent_system_prompt() -> str:
     """
     Build agent system prompt with dynamic tools list.
-
-    Tools are loaded from registry, so adding a new tool to TOOLS_SCHEMA
-    automatically makes it available to the agent.
     """
     tools_desc = get_tools_description()
     return AUTOPOST_AGENT_PROMPT.format(tools_desc=tools_desc)
@@ -43,54 +40,63 @@ class AutoPostService:
         self.twitter = TwitterClient()
         self.tier_manager = tier_manager
 
-    def _validate_plan(self, plan: list[dict]) -> None:
+    def _sanitize_plan(self, plan: list[dict]) -> list[dict]:
         """
-        Validate the agent's plan.
+        Sanitize the agent's plan instead of hard-failing.
 
         Rules:
-        - generate_image must be last if present
         - Only known tools allowed
         - Max 3 steps
+        - generate_image must be last if present
         """
-        if len(plan) > 3:
-            raise ValueError(f"Plan too long: {len(plan)} steps (max 3)")
+        if not isinstance(plan, list):
+            logger.warning("[AUTOPOST] Plan is not a list — stripping plan")
+            return []
 
+        sanitized = []
         has_image = False
-        for i, step in enumerate(plan):
+
+        for step in plan:
+            if not isinstance(step, dict):
+                continue
+
             tool_name = step.get("tool")
+            params = step.get("params", {})
 
             if tool_name not in TOOLS:
-                raise ValueError(f"Unknown tool: {tool_name}")
+                logger.warning(f"[AUTOPOST] Unknown tool requested by agent: {tool_name} — skipping")
+                continue
 
             if tool_name == "generate_image":
                 if has_image:
-                    raise ValueError("Multiple generate_image calls not allowed")
-                if i != len(plan) - 1:
-                    raise ValueError("generate_image must be the last step in plan")
+                    logger.warning("[AUTOPOST] Multiple generate_image calls — skipping")
+                    continue
                 has_image = True
 
-        logger.info(f"[AUTOPOST] Plan validated: {len(plan)} steps")
+            sanitized.append({"tool": tool_name, "params": params})
+
+            if len(sanitized) >= 3:
+                logger.warning("[AUTOPOST] Plan exceeded max length — truncating")
+                break
+
+        # Ensure generate_image is last
+        image_steps = [s for s in sanitized if s["tool"] == "generate_image"]
+        non_image_steps = [s for s in sanitized if s["tool"] != "generate_image"]
+
+        final_plan = non_image_steps + image_steps[:1]
+
+        logger.info(f"[AUTOPOST] Plan sanitized: {len(final_plan)} steps")
+        return final_plan
 
     async def run(self) -> dict[str, Any]:
         """
         Execute the agent autopost flow.
-
-        Single continuous conversation:
-        1. User: context + request for plan
-        2. Assistant: plan
-        3. User: tool result
-        4. ... repeat for each tool ...
-        5. User: request for final text
-        6. Assistant: post text
-
-        Returns:
-            Summary of what happened.
         """
         start_time = time.time()
         logger.info("[AUTOPOST] === Starting ===")
 
         try:
-            # Step 0: Check if posting is allowed (tier limits)
+            # Step 0: Tier check
             if self.tier_manager:
                 can_post, reason = self.tier_manager.can_post()
                 if not can_post:
@@ -102,12 +108,12 @@ class AutoPostService:
                         "usage_percent": self.tier_manager.get_usage_percent()
                     }
 
-            # Step 1: Get context
+            # Step 1: Context
             logger.info("[AUTOPOST] [1/5] Loading context...")
             previous_posts = await self.db.get_recent_posts_formatted(limit=50)
             logger.info(f"[AUTOPOST] [1/5] Loaded {len(previous_posts)} chars of previous posts")
 
-            # Step 2: Build initial messages
+            # Step 2: Initial messages
             system_prompt = SYSTEM_PROMPT + get_agent_system_prompt()
 
             messages = [
@@ -119,23 +125,23 @@ class AutoPostService:
 Now create your plan. What tools do you need (if any)?"""}
             ]
 
-            # Step 3: Get plan from LLM
+            # Step 3: Planner
             logger.info("[AUTOPOST] [2/5] Creating plan - calling LLM...")
             plan_result = await self.llm.chat(messages, PLAN_SCHEMA)
 
-            plan = plan_result["plan"]
+            raw_plan = plan_result.get("plan", [])
+            reasoning = plan_result.get("reasoning", "")
+
+            plan = self._sanitize_plan(raw_plan)
+
             tools_list = " -> ".join([s["tool"] for s in plan]) if plan else "none"
             logger.info(f"[AUTOPOST] [2/5] Plan: {len(plan)} tools ({tools_list})")
-            logger.info(f"[AUTOPOST] [2/5] Reasoning: {plan_result['reasoning'][:100]}...")
+            logger.info(f"[AUTOPOST] [2/5] Reasoning: {reasoning[:100]}...")
 
-            # Add assistant response to conversation
             messages.append({"role": "assistant", "content": json.dumps(plan_result)})
 
-            # Step 4: Validate plan
-            self._validate_plan(plan)
-
-            # Step 5: Execute plan with step-by-step LLM reactions
-            logger.info("[AUTOPOST] [3/5] Executing tools (step-by-step)...")
+            # Step 4: Execute tools
+            logger.info("[AUTOPOST] [3/5] Executing tools...")
             image_bytes = None
             tools_used = []
 
@@ -146,95 +152,61 @@ Now create your plan. What tools do you need (if any)?"""}
 
                 if tool_name == "web_search":
                     query = params.get("query", "")
-                    logger.info(f"[AUTOPOST] [3/5] [{i+1}/{len(plan)}] web_search - query: {query[:50]}...")
-
                     result = await TOOLS[tool_name](query)
-
-                    if result.get("error"):
-                        logger.warning(f"[AUTOPOST] [3/5] web_search: FAILED - {result['content']}")
-                        messages.append({"role": "user", "content": f"Tool result (web_search): {result['content']}"})
-                    else:
-                        logger.info(f"[AUTOPOST] [3/5] web_search: OK ({len(result['sources'])} sources)")
-                        tool_result_msg = f"""Tool result (web_search):
-Content: {result['content']}
-Sources found: {len(result['sources'])}"""
-                        messages.append({"role": "user", "content": tool_result_msg})
+                    messages.append({"role": "user", "content": f"Tool result (web_search): {result.get('content', '')}"})
 
                 elif tool_name == "generate_image":
                     prompt = params.get("prompt", "")
-                    logger.info(f"[AUTOPOST] [3/5] [{i+1}/{len(plan)}] generate_image - prompt: {prompt[:50]}...")
-
                     image_bytes = await TOOLS[tool_name](prompt)
+                    messages.append({"role": "user", "content": "Tool result (generate_image): completed"})
 
-                    if image_bytes:
-                        logger.info(f"[AUTOPOST] [3/5] generate_image: OK ({len(image_bytes)} bytes)")
-                        messages.append({"role": "user", "content": "Tool result (generate_image): Image generated successfully. It will be attached to your post."})
-                    else:
-                        logger.warning(f"[AUTOPOST] [3/5] generate_image: FAILED - continuing without image")
-                        messages.append({"role": "user", "content": "Tool result (generate_image): Failed to generate image. Continue without it."})
-
-                # Step-by-step: LLM reacts to tool result
-                logger.info(f"[AUTOPOST] [3/5] [{i+1}/{len(plan)}] Getting LLM reaction...")
                 reaction = await self.llm.chat(messages, TOOL_REACTION_SCHEMA)
-                thinking = reaction.get("thinking", "")
-                logger.info(f"[AUTOPOST] [3/5] [{i+1}/{len(plan)}] Thinking: {thinking[:80]}...")
-                messages.append({"role": "assistant", "content": thinking})
+                messages.append({"role": "assistant", "content": reaction.get("thinking", "")})
 
-            # Step 6: Get final post text
-            logger.info("[AUTOPOST] [4/5] Generating tweet - calling LLM...")
-
-            messages.append({"role": "user", "content": "Now write your final tweet text (max 280 characters). Just the tweet, nothing else."})
+            # Step 5: Final tweet
+            logger.info("[AUTOPOST] [4/5] Generating tweet...")
+            messages.append({"role": "user", "content": "Now write your final tweet text (max 280 characters). Just the tweet."})
 
             post_result = await self.llm.chat(messages, POST_TEXT_SCHEMA)
-            post_text = post_result["post_text"].strip()
 
-            # Ensure within limit
-            if len(post_text) > 280:
-                post_text = post_text[:277] + "..."
+            # SAFETY: tolerate string or dict
+            if isinstance(post_result, dict):
+                post_text = post_result.get("post_text") or post_result.get("post") or ""
+            else:
+                post_text = str(post_result)
 
-            logger.info(f"[AUTOPOST] [4/5] Tweet: {post_text[:50]}... ({len(post_text)} chars)")
+            post_text = post_text.strip()[:280]
+            logger.info(f"[AUTOPOST] Tweet ready ({len(post_text)} chars)")
 
-            # Step 7: Upload image if generated
+            # Step 6: Upload image
             media_ids = None
             if image_bytes:
-                logger.info("[AUTOPOST] [5/5] Uploading image...")
                 try:
                     media_id = await self.twitter.upload_media(image_bytes)
                     media_ids = [media_id]
-                    logger.info(f"[AUTOPOST] [5/5] Image uploaded: {media_id}")
                 except Exception as e:
-                    logger.error(f"[AUTOPOST] [5/5] Image upload FAILED: {e}")
-                    image_bytes = None  # Mark as no image for summary
+                    logger.error(f"[AUTOPOST] Image upload failed: {e}")
+                    image_bytes = None
 
-            # Step 8: Post to Twitter
-            logger.info("[AUTOPOST] [5/5] Posting to Twitter...")
+            # Step 7: Post
             tweet_data = await self.twitter.post(post_text, media_ids=media_ids)
+            await self.db.save_post(post_text, tweet_data["id"], image_bytes is not None)
 
-            # Step 9: Save to database
-            include_picture = image_bytes is not None
-            await self.db.save_post(post_text, tweet_data["id"], include_picture)
-
-            # Summary
             duration = round(time.time() - start_time, 1)
-            tools_str = ",".join(tools_used) if tools_used else "none"
             logger.info(f"[AUTOPOST] === Completed in {duration}s ===")
-            logger.info(f"[AUTOPOST] Summary: tweet_id={tweet_data['id']} | tools={tools_str} | image={'yes' if include_picture else 'no'} | chars={len(post_text)}")
 
             return {
                 "success": True,
                 "tweet_id": tweet_data["id"],
                 "text": post_text,
-                "plan": plan_result["plan"],
-                "reasoning": plan_result["reasoning"],
                 "tools_used": tools_used,
-                "has_image": include_picture,
+                "has_image": image_bytes is not None,
                 "duration_seconds": duration
             }
 
         except Exception as e:
             duration = round(time.time() - start_time, 1)
             logger.error(f"[AUTOPOST] === FAILED after {duration}s ===")
-            logger.error(f"[AUTOPOST] Error: {e}")
             logger.exception(e)
             return {
                 "success": False,
