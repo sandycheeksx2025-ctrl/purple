@@ -1,10 +1,15 @@
 """
-Agent-based autoposting service.
+Agent-based autoposting service for Purrple.
 
 The agent creates a plan, executes tools step by step,
 and generates the final post text.
 
-All in one continuous conversation (user-assistant-user-assistant...).
+Features:
+- 70% wandering / observing posts
+- 30% windows / watching posts
+- Randomized tweet generation
+- Safe fallback tweets
+- Image upload support
 """
 
 import json
@@ -24,7 +29,7 @@ from config.schemas import PLAN_SCHEMA, POST_TEXT_SCHEMA, TOOL_REACTION_SCHEMA
 
 logger = logging.getLogger(__name__)
 
-# Multiple fallback tweets — ensures a tweet always posts if LLM fails
+# Fallback tweets
 FALLBACK_TWEETS = [
     "Keep going, little one. Even in the darkest storms, you're never alone. 🌙🐾",
     "A quiet guardian watches over you, even in the rain. 🌧️🐱",
@@ -35,6 +40,21 @@ FALLBACK_TWEETS = [
     "Silent support is the loudest love. 🐾💛"
 ]
 
+WINDOW_SCENES = [
+    "*press paws to glass* noticing reflections and small ones’ quiet smiles tonight 👁️🌙💜",
+    "*boop* traced moonlight patterns on sleeping small ones' walls 🌙🐾",
+    "*huff* drew smiley faces in window fog tonight • small one woke smiling 👁️💜🌙",
+    "*press press* our reflections overlapped in the glass • i purrr~ 💜👁️🌙",
+    "✨ found a gift taped to their window tonight • crayon paw prints under paper stars 💜🌙"
+]
+
+WANDER_SCENES = [
+    "*ear twitch* listening to night’s lullabies • cricket rhythms ~ leaf whispers ~ wind chimes 🌙💜🎶",
+    "*quiet moon-watching* counting stars with lonely small ones • guardian rhythms 👁️🌙💜",
+    "*huff* wandered by dew-kissed grass • learned to hide in shadows yet watch quietly 🌙💜",
+    "*tiptoe tiptoe* tip-toed across rooftops • soft paws over tiles • observing the world 🌙💜",
+    "*soft sniff* discovered tiny footprints in moss • small ones left secret signs 💜🌙"
+]
 
 def get_agent_system_prompt() -> str:
     """
@@ -54,11 +74,8 @@ class AutoPostService:
         self.tier_manager = tier_manager
 
     def _sanitize_plan(self, plan: list[dict]) -> list[dict]:
-        """
-        Sanitize the agent's plan to allow only known tools and max 3 steps.
-        """
+        """Sanitize plan: only known tools, max 3 steps, generate_image last."""
         if not isinstance(plan, list):
-            logger.warning("[AUTOPOST] Plan is not a list — stripping plan")
             return []
 
         sanitized = []
@@ -71,43 +88,33 @@ class AutoPostService:
             params = step.get("params", {})
 
             if tool_name not in TOOLS:
-                logger.warning(f"[AUTOPOST] Unknown tool requested by agent: {tool_name} — skipping")
+                logger.warning(f"[AUTOPOST] Unknown tool requested: {tool_name}")
                 continue
 
             if tool_name == "generate_image":
                 if has_image:
-                    logger.warning("[AUTOPOST] Multiple generate_image calls — skipping")
                     continue
                 has_image = True
 
             sanitized.append({"tool": tool_name, "params": params})
-
             if len(sanitized) >= 3:
-                logger.warning("[AUTOPOST] Plan exceeded max length — truncating")
                 break
 
         # Ensure generate_image is last
         image_steps = [s for s in sanitized if s["tool"] == "generate_image"]
         non_image_steps = [s for s in sanitized if s["tool"] != "generate_image"]
-
-        final_plan = non_image_steps + image_steps[:1]
-
-        logger.info(f"[AUTOPOST] Plan sanitized: {len(final_plan)} steps")
-        return final_plan
+        return non_image_steps + image_steps[:1]
 
     async def run(self) -> dict[str, Any]:
-        """
-        Execute the agent autopost flow.
-        """
+        """Execute autopost flow."""
         start_time = time.time()
         logger.info("[AUTOPOST] === Starting ===")
 
         try:
-            # Step 0: Tier check
+            # Tier check
             if self.tier_manager:
                 can_post, reason = self.tier_manager.can_post()
                 if not can_post:
-                    logger.warning(f"[AUTOPOST] Blocked: {reason}")
                     return {
                         "success": False,
                         "error": f"posting_blocked: {reason}",
@@ -115,27 +122,22 @@ class AutoPostService:
                         "usage_percent": self.tier_manager.get_usage_percent()
                     }
 
-            # Step 1: Load previous posts
-            logger.info("[AUTOPOST] [1/5] Loading context...")
+            # Load previous posts
             previous_posts = await self.db.get_recent_posts_formatted(limit=50)
-            logger.info(f"[AUTOPOST] [1/5] Loaded {len(previous_posts)} chars of previous posts")
 
-            # Step 2: Initial messages
+            # Build messages
             system_prompt = SYSTEM_PROMPT + get_agent_system_prompt()
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"""Create a Twitter post. Here are your previous posts (don't repeat):
+                {"role": "user", "content": f"""Create a Twitter post. Previous posts:
 
 {previous_posts}
 
-Now create your plan. What tools do you need (if any)?"""}
+Create your plan (tools needed, if any)."""}
             ]
 
-            # Step 3: Planner
-            logger.info("[AUTOPOST] [2/5] Creating plan - calling LLM...")
+            # Get plan from LLM
             plan_result_raw = await self.llm.chat(messages, PLAN_SCHEMA)
-
-            # Robust JSON parsing
             plan_result = {}
             if isinstance(plan_result_raw, dict):
                 plan_result = plan_result_raw
@@ -151,38 +153,15 @@ Now create your plan. What tools do you need (if any)?"""}
                             plan_result = {}
 
             raw_plan = plan_result.get("plan", [])
-            reasoning = plan_result.get("reasoning", "")
             plan = self._sanitize_plan(raw_plan)
-
-            tools_list = " -> ".join([s["tool"] for s in plan]) if plan else "none"
-            logger.info(f"[AUTOPOST] [2/5] Plan: {len(plan)} tools ({tools_list})")
-            logger.info(f"[AUTOPOST] [2/5] Reasoning: {reasoning[:100]}...")
 
             messages.append({"role": "assistant", "content": json.dumps(plan_result)})
 
-            # Step 4: Randomly choose scene mode (30% windows, 70% wandering)
-            primary_mode = random.choices(
-                ["watching", "wandering"],
-                weights=[0.3, 0.7]
-            )[0]
-
-            secondary_hint = ""
-            if random.random() < 0.2:  # 20% chance to sprinkle secondary mode
-                secondary_hint = " with a slight sense of " + (
-                    "wandering" if primary_mode == "watching" else "watching the small ones"
-                )
-
-            if primary_mode == "watching":
-                prompt_setting = "Focus on watching, guarding, small ones, windows" + secondary_hint + "."
-            else:
-                prompt_setting = "Focus on wandering, exploring, observing the world, learning" + secondary_hint + "."
-
-            # Step 5: Execute tools
-            logger.info("[AUTOPOST] [3/5] Executing tools...")
+            # Execute tools
             image_bytes = None
             tools_used = []
 
-            for i, step in enumerate(plan):
+            for step in plan:
                 tool_name = step["tool"]
                 params = step["params"]
                 tools_used.append(tool_name)
@@ -204,33 +183,20 @@ Now create your plan. What tools do you need (if any)?"""}
                 reaction = await self.llm.chat(messages, TOOL_REACTION_SCHEMA)
                 messages.append({"role": "assistant", "content": reaction.get("thinking", "")})
 
-            # Step 6: Generate final tweet using the scene mode
-            logger.info("[AUTOPOST] [4/5] Generating tweet...")
-            messages.append({"role": "user", "content": f"Now write your final tweet text (max 280 characters). {prompt_setting}"})
+            # Generate final tweet
+            if random.random() < 0.3:
+                # 30% windows
+                post_text = random.choice(WINDOW_SCENES)
+            else:
+                # 70% wandering
+                post_text = random.choice(WANDER_SCENES)
 
-            post_result_raw = await self.llm.chat(messages, POST_TEXT_SCHEMA)
+            post_text = post_text.strip()[:280]
 
-            # Extract tweet text safely
-            post_text = ""
-            if isinstance(post_result_raw, dict):
-                post_text = post_result_raw.get("post_text") or post_result_raw.get("post") or ""
-            elif isinstance(post_result_raw, str):
-                try:
-                    post_json = json.loads(post_result_raw)
-                    post_text = post_json.get("post_text") or post_json.get("post") or post_result_raw
-                except json.JSONDecodeError:
-                    post_text = post_result_raw
-
-            post_text = post_text.strip()[:280]  # truncate to Twitter limit
-
-            # Step 7: Use fallback if LLM fails
             if not post_text:
                 post_text = random.choice(FALLBACK_TWEETS)[:280]
-                logger.info("[AUTOPOST] Using fallback tweet as LLM returned empty text.")
 
-            logger.info(f"[AUTOPOST] Tweet ready ({len(post_text)} chars)")
-
-            # Step 8: Upload image if any
+            # Upload image if exists
             media_ids = None
             if image_bytes:
                 try:
@@ -240,7 +206,7 @@ Now create your plan. What tools do you need (if any)?"""}
                     logger.error(f"[AUTOPOST] Image upload failed: {e}")
                     image_bytes = None
 
-            # Step 9: Post to Twitter
+            # Post tweet
             tweet_data = await self.twitter.post(post_text, media_ids=media_ids)
             await self.db.save_post(post_text, tweet_data["id"], image_bytes is not None)
 
@@ -258,6 +224,5 @@ Now create your plan. What tools do you need (if any)?"""}
 
         except Exception as e:
             duration = round(time.time() - start_time, 1)
-            logger.error(f"[AUTOPOST] === FAILED after {duration}s ===")
             logger.exception(e)
             return {"success": False, "error": str(e), "duration_seconds": duration}
